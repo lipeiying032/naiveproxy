@@ -50,7 +50,7 @@ bool WebSocketFrameBuffer::TakeStatus(uint8_t* status) {
       frames_.erase(it);
       return true;
     }
-    (*it)->payload = (*it)->payload.subspan(1);
+    (*it)->payload = (*it)->payload.subspan<1>();
     (*it)->header.payload_length = (*it)->payload.size();
     return true;
   }
