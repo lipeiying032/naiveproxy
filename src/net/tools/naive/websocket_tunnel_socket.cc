@@ -113,6 +113,7 @@ int WebSocketTunnelSocket::Connect(CompletionOnceCallback callback) {
   }
   DCHECK(!connect_callback_ && !stream_ && !request_);
   connect_callback_ = std::move(callback);
+  state_ = State::kConnecting;
   request_ = WebSocketStream::CreateAndConnectStream(
       url_, {}, url::Origin::Create(ChangeWebSocketSchemeToHttpScheme(url_)),
       StorageAccessApiStatus::kNone,
