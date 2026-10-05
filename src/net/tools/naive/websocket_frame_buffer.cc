@@ -37,13 +37,21 @@ void WebSocketFrameBuffer::Append(
 }
 
 bool WebSocketFrameBuffer::TakeStatus(uint8_t* status) {
+  // The status byte is expected to be the first byte of its own binary message.
+  // A peer that packs more bytes into that message is not losing them here:
+  // the rest of the frame is kept and read back as tunnel payload.
   for (auto it = frames_.begin(); it != frames_.end(); ++it) {
     if ((*it)->header.opcode != WebSocketFrameHeader::kOpCodeBinary ||
         (*it)->payload.empty()) {
       continue;
     }
     *status = (*it)->payload[0];
-    frames_.erase(it);
+    if ((*it)->payload.size() == 1) {
+      frames_.erase(it);
+      return true;
+    }
+    (*it)->payload = (*it)->payload.subspan(1);
+    (*it)->header.payload_length = (*it)->payload.size();
     return true;
   }
   return false;
