@@ -9,8 +9,6 @@
 #pragma allow_unsafe_buffers
 #endif
 
-#include <algorithm>
-#include <cstring>
 #include <utility>
 
 #include "base/check.h"
@@ -168,6 +166,10 @@ int WebSocketTunnelSocket::GetPeerAddress(IPEndPoint* address) const {
 }
 
 int WebSocketTunnelSocket::GetLocalAddress(IPEndPoint*) const {
+  // WebSocketStream does not expose the local endpoint of its transport, and
+  // TransportInfo only carries the peer endpoint, which GetPeerAddress()
+  // reports. Report the address as unavailable rather than filling in an
+  // uninitialized endpoint.
   return ERR_SOCKET_NOT_CONNECTED;
 }
 
@@ -184,10 +186,15 @@ NextProto WebSocketTunnelSocket::GetNegotiatedProtocol() const {
 }
 
 bool WebSocketTunnelSocket::GetSSLInfo(SSLInfo*) {
+  // Do not delegate to the WebSocket stream: while it may connect to the
+  // frontend with TLS, this object represents the tunneled TCP connection to
+  // the origin. Same reasoning as HttpProxyClientSocket::GetSSLInfo().
   return false;
 }
 
 int64_t WebSocketTunnelSocket::GetTotalReceivedBytes() const {
+  // WebSocketStream exposes no byte counter. StreamSocket documents 0 as the
+  // return value for sockets that do not implement this.
   return 0;
 }
 
@@ -232,8 +239,8 @@ int WebSocketTunnelSocket::Write(IOBuffer* buffer,
   DCHECK(!write_pending_ && write_frames_.empty());
   ever_used_ = true;
   write_payload_ = base::MakeRefCounted<IOBufferWithSize>(length);
-  std::memcpy(write_payload_->data(), buffer->data(),
-              base::checked_cast<size_t>(length));
+  write_payload_->first(base::checked_cast<size_t>(length))
+      .copy_from(buffer->first(base::checked_cast<size_t>(length)));
   auto frame =
       std::make_unique<WebSocketFrame>(WebSocketFrameHeader::kOpCodeBinary);
   frame->header.final = true;
@@ -296,7 +303,7 @@ void WebSocketTunnelSocket::SendTarget() {
   }
   auto payload_buffer = base::MakeRefCounted<IOBufferWithSize>(
       base::checked_cast<int>(payload->size()));
-  std::memcpy(payload_buffer->data(), payload->data(), payload->size());
+  payload_buffer->span().copy_from(*payload);
   auto frame =
       std::make_unique<WebSocketFrame>(WebSocketFrameHeader::kOpCodeBinary);
   frame->header.final = true;
@@ -360,10 +367,7 @@ void WebSocketTunnelSocket::OnReadFrames(int result) {
   if (control_frames.ping_payload) {
     pong_payload_ = base::MakeRefCounted<IOBufferWithSize>(
         base::checked_cast<int>(control_frames.ping_payload->size()));
-    if (!control_frames.ping_payload->empty()) {
-      std::memcpy(pong_payload_->data(), control_frames.ping_payload->data(),
-                  control_frames.ping_payload->size());
-    }
+    pong_payload_->span().copy_from(*control_frames.ping_payload);
     pong_pending_ = true;
   }
   if (connect_callback_) {

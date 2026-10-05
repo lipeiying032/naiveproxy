@@ -16,6 +16,19 @@ namespace net {
 
 // Presents decoded WebSocket frames to Naive as a byte stream while keeping
 // partially consumed frames intact.
+//
+// Lifetime: the frames are owned by WebSocketStream, which only guarantees
+// their payloads until the next ReadFrames() call (see
+// net/websockets/websocket_stream.h). Callers must drain this buffer before
+// reading more frames.
+//
+// Consumption:
+// - Append() takes the frames over; ProcessControlFrames() consumes Ping/Pong
+//   and reports Close, leaving data frames in place for Read().
+// - TakeStatus() consumes the status byte at the head of the first non-empty
+//   binary frame; the rest of that frame, if any, stays buffered as payload.
+// - Read() consumes payload bytes and resumes a partially consumed frame.
+// - Clear() drops everything, including a partially consumed frame.
 class WebSocketFrameBuffer {
  public:
   struct ControlFrames {

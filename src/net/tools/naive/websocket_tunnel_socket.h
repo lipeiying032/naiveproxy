@@ -84,7 +84,6 @@ class WebSocketTunnelSocket : public StreamSocket {
 
  private:
   class ConnectDelegate;
-  friend class WebSocketTunnelSocketTest;
   enum class State { kDisconnected, kConnecting, kConnected };
 
   void OnConnectSuccess(
@@ -114,7 +113,7 @@ class WebSocketTunnelSocket : public StreamSocket {
   HostPortPair target_;
   raw_ptr<URLRequestContext> context_;
   NetLogWithSource net_log_;
-  const NetworkTrafficAnnotationTag& annotation_;
+  const NetworkTrafficAnnotationTag annotation_;
   IPEndPoint peer_address_;
   NextProto protocol_ = NextProto::kProtoUnknown;
   PaddingType padding_type_ = PaddingType::kNone;

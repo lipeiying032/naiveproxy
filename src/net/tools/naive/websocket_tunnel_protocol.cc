@@ -18,6 +18,7 @@
 namespace net {
 namespace {
 
+constexpr uint8_t kTunnelProtocolVersion = 1;
 constexpr uint8_t kAddressTypeIPv4 = 1;
 constexpr uint8_t kAddressTypeDomain = 3;
 constexpr uint8_t kAddressTypeIPv6 = 4;
@@ -70,7 +71,7 @@ std::optional<std::vector<uint8_t>> EncodeWebSocketTarget(
 
   std::vector<uint8_t> payload;
   payload.reserve(4 + (address ? address_size : 1 + host.size()));
-  payload.push_back(1);  // Tunnel protocol version.
+  payload.push_back(kTunnelProtocolVersion);
   payload.push_back(address_type);
   if (address) {
     for (uint8_t byte : address->bytes()) {
