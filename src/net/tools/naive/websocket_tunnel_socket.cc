@@ -13,6 +13,8 @@
 #include <cstring>
 #include <utility>
 
+#include "base/check.h"
+#include "base/check_op.h"
 #include "base/functional/bind.h"
 #include "base/logging.h"
 #include "base/numerics/safe_conversions.h"
@@ -125,6 +127,10 @@ int WebSocketTunnelSocket::Connect(CompletionOnceCallback callback) {
 
 void WebSocketTunnelSocket::Disconnect() {
   request_.reset();
+  // Shut down anything that may call us back: in-flight WebSocketStream
+  // callbacks are dropped with the stream, and completions that were already
+  // posted to the task runner become no-ops.
+  weak_factory_.InvalidateWeakPtrs();
   if (stream_) {
     stream_->Close();
     stream_.reset();
@@ -191,6 +197,7 @@ int WebSocketTunnelSocket::Read(IOBuffer* buffer,
                                 int length,
                                 CompletionOnceCallback callback) {
   DCHECK(buffer && length > 0);
+  DCHECK(!callback.is_null());
   if (!IsConnected()) {
     return ERR_SOCKET_NOT_CONNECTED;
   }
@@ -215,6 +222,7 @@ int WebSocketTunnelSocket::Write(IOBuffer* buffer,
                                  CompletionOnceCallback callback,
                                  const NetworkTrafficAnnotationTag&) {
   DCHECK(buffer && length >= 0);
+  DCHECK(!callback.is_null());
   if (!IsConnected()) {
     return ERR_SOCKET_NOT_CONNECTED;
   }
@@ -276,7 +284,6 @@ void WebSocketTunnelSocket::OnConnectSuccess(
 
 void WebSocketTunnelSocket::OnConnectFailure(int error) {
   request_.reset();
-  stream_.reset();
   Fail(error == OK || error == ERR_IO_PENDING ? ERR_CONNECTION_FAILED : error);
 }
 
@@ -307,10 +314,10 @@ void WebSocketTunnelSocket::SendTarget() {
 }
 
 void WebSocketTunnelSocket::OnTargetSent(int result) {
+  DCHECK_NE(ERR_IO_PENDING, result);
   write_frames_.clear();
   write_payload_.reset();
   if (result != OK) {
-    stream_.reset();
     Fail(result);
     return;
   }
@@ -321,6 +328,7 @@ void WebSocketTunnelSocket::OnTargetSent(int result) {
 }
 
 int WebSocketTunnelSocket::ReadFrames() {
+  DCHECK(stream_);
   read_frames_.clear();
   return stream_->ReadFrames(
       &read_frames_, base::BindOnce(&WebSocketTunnelSocket::OnReadFrames,
@@ -328,21 +336,24 @@ int WebSocketTunnelSocket::ReadFrames() {
 }
 
 void WebSocketTunnelSocket::OnReadFrames(int result) {
+  DCHECK_NE(ERR_IO_PENDING, result);
   if (result < 0) {
-    stream_.reset();
-    state_ = State::kDisconnected;
     if (read_pending_) {
+      // The read is the operation that observed the error, so it keeps the
+      // original error code.
+      stream_.reset();
+      state_ = State::kDisconnected;
       CompleteRead(result);
-    } else if (connect_callback_) {
-      Fail(ERR_TUNNEL_CONNECTION_FAILED);
     }
+    // Fail() is idempotent and reports the failure to any other observer that
+    // is still waiting (a pending connect or write).
+    Fail(ERR_TUNNEL_CONNECTION_FAILED);
     return;
   }
 
   frame_buffer_.Append(std::move(read_frames_));
   const auto control_frames = frame_buffer_.ProcessControlFrames();
   if (control_frames.closed) {
-    stream_.reset();
     Fail(ERR_TUNNEL_CONNECTION_FAILED);
     return;
   }
@@ -358,7 +369,6 @@ void WebSocketTunnelSocket::OnReadFrames(int result) {
   if (connect_callback_) {
     uint8_t status = 0;
     if (!frame_buffer_.TakeStatus(&status) || status != 0) {
-      stream_.reset();
       Fail(ERR_TUNNEL_CONNECTION_FAILED);
       return;
     }
@@ -396,6 +406,12 @@ int WebSocketTunnelSocket::BeginWrite() {
 }
 
 void WebSocketTunnelSocket::OnWriteComplete(int result) {
+  DCHECK_NE(ERR_IO_PENDING, result);
+  if (!write_pending_) {
+    // A completion that outlived its write, e.g. the socket was disconnected
+    // before a synchronously completed write was posted.
+    return;
+  }
   write_frames_.clear();
   write_payload_.reset();
   if (result != OK) {
@@ -431,11 +447,12 @@ void WebSocketTunnelSocket::SendPong() {
       &pong_frames_, base::BindOnce(&WebSocketTunnelSocket::OnPongComplete,
                                     weak_factory_.GetWeakPtr()));
   if (result != ERR_IO_PENDING) {
-    OnPongComplete(result);
+    PostOnPongComplete(result);
   }
 }
 
 void WebSocketTunnelSocket::OnPongComplete(int result) {
+  DCHECK_NE(ERR_IO_PENDING, result);
   pong_frames_.clear();
   pong_payload_.reset();
   pong_write_pending_ = false;
@@ -481,12 +498,16 @@ void WebSocketTunnelSocket::Post(base::OnceClosure task) {
 }
 
 void WebSocketTunnelSocket::CompleteConnect(int result) {
+  // Must reset the state before invoking the callback, which may reenter
+  // Connect().
   CompletionOnceCallback callback = std::move(connect_callback_);
   connect_callback_.Reset();
   std::move(callback).Run(result);
 }
 
 void WebSocketTunnelSocket::CompleteRead(int result) {
+  // Must reset the state before invoking the callback, which may reenter
+  // Read().
   read_pending_ = false;
   read_buffer_ = nullptr;
   read_buffer_len_ = 0;
@@ -496,6 +517,8 @@ void WebSocketTunnelSocket::CompleteRead(int result) {
 }
 
 void WebSocketTunnelSocket::CompleteWrite(int result) {
+  // Must reset the state before invoking the callback, which may reenter
+  // Write().
   write_pending_ = false;
   write_size_ = 0;
   CompletionOnceCallback callback = std::move(write_callback_);
@@ -504,12 +527,19 @@ void WebSocketTunnelSocket::CompleteWrite(int result) {
 }
 
 void WebSocketTunnelSocket::Fail(int error) {
+  // The single place where a failed tunnel is torn down: drop the stream and
+  // complete every operation that is still waiting. A socket can have a read
+  // and a write pending at the same time, and both observers have to learn
+  // about the failure.
+  stream_.reset();
   state_ = State::kDisconnected;
   if (connect_callback_) {
     CompleteConnect(error);
-  } else if (read_pending_) {
+  }
+  if (read_pending_) {
     CompleteRead(error);
-  } else if (write_pending_) {
+  }
+  if (write_pending_) {
     CompleteWrite(error);
   }
 }
