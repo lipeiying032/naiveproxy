@@ -1,0 +1,324 @@
+name: Reality
+
+# Builds naiveproxy with the REALITY client patch from
+# https://github.com/lipeiying032/naivereality (patches/naiveproxy-reality-client.patch)
+# applied on top of the pinned upstream revision. Triggered by pushes to this
+# branch, or manually via workflow_dispatch.
+on:
+  workflow_dispatch:
+  push:
+    branches: [reality]
+
+env:
+  CACHE_EPOCH: 1
+  CCACHE_MAXSIZE: 300M
+  CCACHE_MAXFILES: 0
+  SCCACHE_CACHE_SIZE: 300M
+  PATCH_URL: https://raw.githubusercontent.com/lipeiying032/naivereality/main/patches/naiveproxy-reality-client.patch
+
+jobs:
+  # ---------------------------------------------------------------------------
+  linux-x64:
+    name: linux-x64 (REALITY)
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+        working-directory: src
+    env:
+      EXTRA_FLAGS: 'target_cpu="x64"'
+      BUNDLE: naiveproxy-reality-linux-x64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Apply the REALITY client patch
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          git log --oneline -1
+          curl -fsSL -o /tmp/naiveproxy-reality-client.patch "$PATCH_URL"
+          sha256sum /tmp/naiveproxy-reality-client.patch
+          git apply --check /tmp/naiveproxy-reality-client.patch
+          git apply /tmp/naiveproxy-reality-client.patch
+          git --no-pager diff --stat
+          test -f src/net/socket/reality_config.cc
+
+      - name: Cache toolchains (Linux)
+        uses: actions/cache@v6
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+            src/qemu-user*.deb
+          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - name: Cache PGO (Linux)
+        uses: actions/cache@v6
+        with:
+          path: src/chrome/build/pgo_profiles/
+          key: pgo-linux-openwrt-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - name: Regenerate Debian keyring
+        run: |
+          rm -f ./build/linux/sysroot_scripts/keyring.gpg
+          GPG_TTY=/dev/null ./build/linux/sysroot_scripts/generate_keyring.sh
+
+      - name: Cache sysroot
+        uses: actions/cache@v6
+        with:
+          path: |
+            src/out/sysroot-build/bullseye/bullseye_*
+            src/out/sysroot-build/trixie/trixie_*
+            src/out/sysroot-build/sid/sid_*
+          key: sysroot-linux-x64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - id: ccache-timestamp
+        run: echo "CCACHE_TIMESTAMP=$(date +%s)" >>$GITHUB_OUTPUT
+
+      - name: Cache ccache files
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-linux-x64-${{ hashFiles('CHROMIUM_VERSION') }}-${{ steps.ccache-timestamp.outputs.CCACHE_TIMESTAMP }}
+          restore-keys: ccache-linux-x64-${{ hashFiles('CHROMIUM_VERSION') }}-
+
+      - name: Install APT packages
+        run: |
+          sudo apt update
+          sudo apt install -y ninja-build pkg-config ccache bubblewrap
+
+      - run: ./get-clang.sh
+      - run: ccache -z
+      - run: ./build.sh
+      - run: ccache -s && ccache --evict-older-than 1d
+      - run: ../tests/basic.sh out/Release/naive
+
+      - name: Pack naiveproxy assets
+        run: |
+          mkdir ${{ env.BUNDLE }}
+          cp out/Release/naive config.json ../LICENSE ../USAGE.txt ${{ env.BUNDLE }}
+          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+          openssl sha256 out/Release/naive >sha256sum.txt
+          cat sha256sum.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BUNDLE }}
+          path: |
+            src/${{ env.BUNDLE }}.tar.xz
+            src/sha256sum.txt
+            src/out/Release/naive
+
+  # ---------------------------------------------------------------------------
+  win-x64:
+    name: win-x64 (REALITY)
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+        working-directory: src
+    env:
+      EXTRA_FLAGS: 'target_cpu="x64"'
+      BUNDLE: naiveproxy-reality-win-x64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Apply the REALITY client patch
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          git log --oneline -1
+          curl -fsSL -o /tmp/naiveproxy-reality-client.patch "$PATCH_URL"
+          git apply --check /tmp/naiveproxy-reality-client.patch
+          git apply /tmp/naiveproxy-reality-client.patch
+          git --no-pager diff --stat
+
+      - name: Cache toolchains
+        uses: actions/cache@v6
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+            ~/.cargo/bin/
+            ~/bin/ninja.exe
+          key: toolchains-win-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - name: Cache PGO (win64)
+        uses: actions/cache@v6
+        with:
+          path: src/chrome/build/pgo_profiles/chrome-win64-*
+          key: pgo-win64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - id: ccache-timestamp
+        run: echo "CCACHE_TIMESTAMP=$(date +%s)" >>$GITHUB_OUTPUT
+
+      - name: Cache ccache files
+        uses: actions/cache@v6
+        with:
+          path: ~/AppData/Local/Mozilla/sccache
+          key: ccache-win-x64-${{ hashFiles('CHROMIUM_VERSION') }}-${{ steps.ccache-timestamp.outputs.CCACHE_TIMESTAMP }}
+          restore-keys: ccache-win-x64-${{ hashFiles('CHROMIUM_VERSION') }}-
+
+      - run: ./get-clang.sh
+      - run: |
+          if [ ! -f ~/bin/ninja.exe ]; then
+            curl -LO https://github.com/ninja-build/ninja/releases/download/v1.10.2/ninja-win.zip
+            unzip -o ninja-win.zip -d ~/bin
+          fi
+      - run: "~/.cargo/bin/sccache -z"
+      - run: ./build.sh
+      - run: "~/.cargo/bin/sccache -s"
+      - run: ../tests/basic.sh out/Release/naive
+
+      - name: Pack naiveproxy assets
+        run: |
+          mkdir ${{ env.BUNDLE }}
+          cp out/Release/naive.exe config.json ../LICENSE ../USAGE.txt ${{ env.BUNDLE }}
+          7z a ${{ env.BUNDLE }}.zip ${{ env.BUNDLE }}
+          openssl sha256 out/Release/naive.exe >sha256sum.txt
+          cat sha256sum.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BUNDLE }}
+          path: |
+            src/${{ env.BUNDLE }}.zip
+            src/sha256sum.txt
+            src/out/Release/naive.exe
+
+  # ---------------------------------------------------------------------------
+  mac-arm64:
+    name: mac-arm64 (REALITY)
+    runs-on: macos-26
+    defaults:
+      run:
+        shell: bash
+        working-directory: src
+    env:
+      EXTRA_FLAGS: 'target_cpu="arm64"'
+      BUNDLE: naiveproxy-reality-mac-arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Apply the REALITY client patch
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          git log --oneline -1
+          curl -fsSL -o /tmp/naiveproxy-reality-client.patch "$PATCH_URL"
+          git apply --check /tmp/naiveproxy-reality-client.patch
+          git apply /tmp/naiveproxy-reality-client.patch
+          git --no-pager diff --stat
+
+      - name: Cache toolchains and PGO
+        uses: actions/cache@v6
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/chrome/build/pgo_profiles/chrome-mac-*
+            src/gn/
+          key: toolchains-pgo-mac-arm64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - id: ccache-timestamp
+        run: echo "CCACHE_TIMESTAMP=$(date +%s)" >>$GITHUB_OUTPUT
+
+      - name: Cache ccache files
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-mac-arm64-${{ hashFiles('CHROMIUM_VERSION') }}-${{ steps.ccache-timestamp.outputs.CCACHE_TIMESTAMP }}
+          restore-keys: ccache-mac-arm64-${{ hashFiles('CHROMIUM_VERSION') }}-
+
+      - run: brew install ninja ccache
+      - run: pip install setuptools
+      - run: ./get-clang.sh
+      - run: ccache -z
+      - run: ./build.sh
+      - run: ccache -s && ccache --evict-older-than 1d
+      - run: ../tests/basic.sh out/Release/naive
+
+      - name: Pack naiveproxy assets
+        run: |
+          mkdir ${{ env.BUNDLE }}
+          cp out/Release/naive config.json ../LICENSE ../USAGE.txt ${{ env.BUNDLE }}
+          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+          openssl sha256 out/Release/naive >sha256sum.txt
+          cat sha256sum.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BUNDLE }}
+          path: |
+            src/${{ env.BUNDLE }}.tar.xz
+            src/sha256sum.txt
+            src/out/Release/naive
+
+  # ---------------------------------------------------------------------------
+  openwrt-aarch64_cortex-a53:
+    name: openwrt-aarch64_cortex-a53 (REALITY)
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+        working-directory: src
+    env:
+      EXTRA_FLAGS: target_cpu="arm64" target_os="openwrt" arm_cpu="cortex-a53"
+      OPENWRT_FLAGS: arch=aarch64_cortex-a53 release=18.06.0 gcc_ver=7.3.0 target=sunxi subtarget=cortexa53
+      BUNDLE: naiveproxy-reality-openwrt-aarch64_cortex-a53
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Apply the REALITY client patch
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          git log --oneline -1
+          curl -fsSL -o /tmp/naiveproxy-reality-client.patch "$PATCH_URL"
+          git apply --check /tmp/naiveproxy-reality-client.patch
+          git apply /tmp/naiveproxy-reality-client.patch
+          git --no-pager diff --stat
+
+      - name: Cache toolchains (OpenWrt)
+        uses: actions/cache@v6
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+            src/qemu-user*.deb
+          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - name: Cache sysroot
+        uses: actions/cache@v6
+        with:
+          path: src/out/sysroot-build/openwrt
+          key: sysroot-openwrt-23.05.0-aarch64_cortex-a53-v${{ env.CACHE_EPOCH }}
+
+      - name: Install APT packages
+        run: |
+          sudo apt update
+          sudo apt install -y ninja-build pkg-config ccache bubblewrap
+          sudo apt remove -y qemu-user-binfmt || true
+          if ls qemu-user*.deb >/dev/null 2>&1; then sudo dpkg -i qemu-user*.deb; fi
+
+      - run: ./get-clang.sh
+      - run: ccache -z
+      - run: ./build.sh
+      - run: |
+          ../tests/basic.sh out/Release/naive || echo "note: basic.sh needs qemu-user-binfmt on the host"
+
+      - name: Pack naiveproxy assets
+        run: |
+          mkdir ${{ env.BUNDLE }}
+          cp out/Release/naive config.json ../LICENSE ../USAGE.txt ${{ env.BUNDLE }}
+          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+          openssl sha256 out/Release/naive >sha256sum.txt
+          cat sha256sum.txt
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ${{ env.BUNDLE }}
+          path: |
+            src/${{ env.BUNDLE }}.tar.xz
+            src/sha256sum.txt
+            src/out/Release/naive
